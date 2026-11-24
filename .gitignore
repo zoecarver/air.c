@@ -3,3 +3,4 @@ air
 cache/
 test/tok
 test/geval
+test/bench

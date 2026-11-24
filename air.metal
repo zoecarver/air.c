@@ -762,53 +762,48 @@ kernel void k_ctl_b(device float *S [[buffer(0)]], device const uchar *W [[buffe
 // ======================= prefill GEMM (simdgroup matrix) =======================
 // Y[row(t)][n] = sum_k W[n][k] * X[xrow(t)][k] for tokens t < T. Tile: 64 rows x 32 tokens, K step 64; 128 threads.
 // The 4-bit tile is decoded once into threadgroup memory (half, scales folded in) and reused by all 32 tokens.
-struct GJob { uint woff_lo, woff_hi, N, K; float gscale; uint e2m1; char tbl[16];
-              uint x, xs, y, ys, T, xidx, yidx, act; };   /* xidx/yidx: offsets (in S) of uint row lists, 0 = identity; act=1: SITU on [gate|up] input */
-#define GT 64          /* tokens per tile */
-template <uint TT> void gemm_tile(device const uchar *W, device float *S, thread const GJob &j, uint n0, uint t0, uint T,
-                      device const uint *xrow, device const uint *yrow, uint tid, uint sg,
+struct GJob { uint woff_lo, woff_hi, N, K; float gscale; uint e2m1; char tbl[16]; uint x, xs, y, ys, T; };	/* x: half rows at S + x, stride xs halves */
+/* Y[t][n0..n0+63] = W[n0..][:] . X[xrow(t)] for TT tokens from t0. NT threads: 2 row halves x NT/64 token groups of
+   simdgroups, each 32 rows x TT/(NT/64) tokens (TT == 8: simdgroups split the 64 rows). Per K step of 64 the 4-bit tile
+   is decoded once into threadgroup memory (scales folded in) and the next step's raw superblocks are prefetched. */
+template <uint TT, uint NT> void gemm_tile(device const uchar *W, device float *S, thread const GJob &j, uint n0, uint t0, uint T,
+                      device const uint *xrow, uint tid, uint sg,
                       threadgroup half *sa, threadgroup half *sb, threadgroup float *so, threadgroup half *cb, threadgroup uint4 *raw) {
+    constexpr uint NSG = NT / 32;
+    constexpr bool T8 = TT == 8;
+    constexpr uint TPS = T8 ? 8 : TT / (NSG / 2), QB = TPS / 8, RB = T8 ? 8 / NSG : 4, NPRE = (144 + NT - 1) / NT;
     const uint K = j.K, KB4 = K / 64; ulong woff = ((ulong)j.woff_hi << 32) | j.woff_lo;
     const float gs = j.gscale;
-    constexpr bool T8 = TT == 8;                                  /* 8-token tile: simdgroups split rows only */
-    constexpr uint QB = T8 ? 1 : TT / 16, RB = T8 ? 2 : 4;        /* token / row blocks of 8 per simdgroup */
     simdgroup_float8x8 mc[RB][QB];
     for (uint i = 0; i < RB; i++) for (uint q = 0; q < QB; q++) mc[i][q] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    const uint rsub = T8 ? sg * 16 : (sg & 1) * 32, tsub = T8 ? 0 : (sg >> 1) * (TT / 2);
+    const uint rsub = T8 ? sg * RB * 8 : (sg & 1) * 32, tsub = T8 ? 0 : (sg >> 1) * TPS;
     if (tid < 16) cb[tid] = half(j.tbl[tid]);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    /* software pipeline: the next K-step's superblocks are loaded into registers while this step decodes / multiplies */
-    uint4 pre[2]; const uint i0 = tid, i1 = tid + 128;
+    uint4 pre[NPRE];
     #define LDRAW(kt_, i_) ((i_) < 144 && n0 + ((i_) / 9) * 4 < j.N ? ((device const uint4 *)(W + woff + ((ulong)(n0 / 4 + (i_) / 9) * KB4 + (kt_)) * 144))[(i_) % 9] : uint4(0))
-    pre[0] = LDRAW(0, i0); pre[1] = LDRAW(0, i1);
+    for (uint p = 0; p < NPRE; p++) pre[p] = LDRAW(0, tid + p * NT);
     for (uint kt = 0; kt < KB4; kt++) {
-        raw[i0] = pre[0]; if (i1 < 144) raw[i1] = pre[1];
+        for (uint p = 0; p < NPRE; p++) if (tid + p * NT < 144) raw[tid + p * NT] = pre[p];
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (kt + 1 < KB4) { pre[0] = LDRAW(kt + 1, i0); pre[1] = LDRAW(kt + 1, i1); }
-        /* weights: 256 units (row-group, kb, row) of 16, two per thread, decoded from threadgroup memory */
-        for (uint u = tid; u < 256; u += 128) { uint g = u >> 4, kb = (u >> 2) & 3, rr = u & 3;
+        if (kt + 1 < KB4) for (uint p = 0; p < NPRE; p++) pre[p] = LDRAW(kt + 1, tid + p * NT);
+        /* weights: 256 units (row group, block, row) of 16 */
+        for (uint u = tid; u < 256; u += NT) { uint g = u >> 4, kb = (u >> 2) & 3, rr = u & 3;
           threadgroup half4 *dst = (threadgroup half4 *)(sa + (g * 4 + rr) * 64 + kb * 16);
           if (n0 + g * 4 >= j.N) { dst[0] = dst[1] = dst[2] = dst[3] = half4(0); }
           else {
             threadgroup const uchar *sbk = (threadgroup const uchar *)(raw + g * 9);
             uint A = ((threadgroup const uint *)(sbk + kb * 32))[rr], Bw = ((threadgroup const uint *)(sbk + kb * 32 + 16))[rr];
-            float sc = as_type<float>((((uint)sbk[128 + kb * 4 + rr]) << 20) + (117u << 23)) * gs;
+            half hs = half(as_type<float>((((uint)sbk[128 + kb * 4 + rr]) << 20) + (117u << 23)) * gs);
             uchar4 a = as_type<uchar4>(A), b = as_type<uchar4>(Bw);
-            half hs = half(sc);
             dst[0] = half4(cb[a.x & 15], cb[a.y & 15], cb[a.z & 15], cb[a.w & 15]) * hs;
             dst[1] = half4(cb[a.x >> 4], cb[a.y >> 4], cb[a.z >> 4], cb[a.w >> 4]) * hs;
             dst[2] = half4(cb[b.x & 15], cb[b.y & 15], cb[b.z & 15], cb[b.w & 15]) * hs;
             dst[3] = half4(cb[b.x >> 4], cb[b.y >> 4], cb[b.z >> 4], cb[b.w >> 4]) * hs; } }
-        /* activations: GT tokens x 64 k, float4 loads */
-        for (uint e = tid; e < TT * 16; e += 128) { uint t = e >> 4, k4 = e & 15; half4 v = half4(0);
-            if (t0 + t < T) { uint xr = xrow ? xrow[t0 + t] : t0 + t; uint kk = kt * 64 + k4 * 4;
-                device const float4 *xp = (device const float4 *)(S + j.x + xr * j.xs + kk);
-                if (j.act) { float4 g = xp[0], up = *(device const float4 *)(S + j.x + xr * j.xs + K + kk);
-                    v = half4(SITU_BETA * tanh(g / SITU_BETA) / (1.0f + exp(-g)) * (SITU_LB * tanh(up / SITU_LB))); }
-                else v = half4(xp[0]); }
+        /* activations: TT tokens x 64 k */
+        for (uint e = tid; e < TT * 16; e += NT) { uint t = e >> 4, k4 = e & 15; half4 v = half4(0);
+            if (t0 + t < T) { uint xr = xrow ? xrow[t0 + t] : t0 + t; v = *(device const half4 *)((device const half *)(S + j.x) + xr * j.xs + kt * 64 + k4 * 4); }
             ((threadgroup half4 *)sb)[t * 16 + k4] = v; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint kk = 0; kk < 64; kk += 8) {
+        for (uint kk = 0; kk < 64 && t0 + tsub < T; kk += 8) {	/* simdgroups past the last token skip the math */
             simdgroup_half8x8 ma[RB], mb[QB];
             for (uint i = 0; i < RB; i++) simdgroup_load(ma[i], sa + (rsub + i * 8) * 64 + kk, 64);
             for (uint q = 0; q < QB; q++) simdgroup_load(mb[q], sb + (tsub + q * 8) * 64 + kk, 64, ulong2(0, 0), true);
@@ -816,26 +811,36 @@ template <uint TT> void gemm_tile(device const uchar *W, device float *S, thread
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    for (uint i = 0; i < RB; i++) for (uint q = 0; q < QB; q++)
-        simdgroup_store(mc[i][q], so + (tsub + q * 8) * 64 + rsub + i * 8, 64, ulong2(0, 0), true);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint e = tid; e < TT * 64; e += 128) { uint t = e >> 6, n = e & 63;
-        if (t0 + t < T && n0 + n < j.N) { uint yr = yrow ? yrow[t0 + t] : t0 + t; S[j.y + yr * j.ys + n0 + n] = so[t * 64 + n]; } }
+    if (n0 + 64 <= j.N && t0 + TT <= T) {		/* full tile: straight to device memory */
+        for (uint i = 0; i < RB; i++) for (uint q = 0; q < QB; q++)
+            simdgroup_store(mc[i][q], S + j.y + (t0 + tsub + q * 8) * j.ys + n0 + rsub + i * 8, j.ys, ulong2(0, 0), true);
+        return;
+    }
+    constexpr uint SH = TT < 64 ? TT : 64;		/* edge tile: stage SH tokens at a time */
+    for (uint h = 0; h < TT; h += SH) {
+        for (uint i = 0; i < RB; i++) for (uint q = 0; q < QB; q++) { uint tt = tsub + q * 8;
+            if (tt >= h && tt < h + SH) simdgroup_store(mc[i][q], so + (tt - h) * 64 + rsub + i * 8, 64, ulong2(0, 0), true); }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint e = tid; e < SH * 64; e += NT) { uint t = e >> 6, n = e & 63;
+            if (t0 + h + t < T && n0 + n < j.N) S[j.y + (t0 + h + t) * j.ys + n0 + n] = so[t * 64 + n]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
 }
-kernel void k_gemm(device const uchar *W [[buffer(0)]], device float *S [[buffer(1)]], constant GJob &j [[buffer(2)]],
+template <uint TT, uint NT> kernel void k_gemm(device const uchar *W [[buffer(0)]], device float *S [[buffer(1)]], constant GJob &j [[buffer(2)]],
                    uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
-    threadgroup float buf[64 * GT];        /* sa (64x64 half) + sb (GTx64 half), then reused as the output stage */
-    threadgroup half *sa = (threadgroup half *)buf, *sb = sa + 64 * 64; threadgroup float *so = buf;
-    device const uint *xr = j.xidx ? (device const uint *)(S + j.xidx) : nullptr, *yr = j.yidx ? (device const uint *)(S + j.yidx) : nullptr;
-    GJob jl = j; threadgroup half cbk[16]; threadgroup uint4 raw[16 * 9];
-    gemm_tile<GT>(W, S, jl, tg.x * 64, tg.y * GT, j.T, xr, yr, tid, sg, sa, sb, so, cbk, raw);
+    threadgroup float buf[(64 * 64 + TT * 64) / 2 > 64 * 64 ? (64 * 64 + TT * 64) / 2 : 64 * 64];	/* sa + sb, reused as the output stage */
+    threadgroup half *sa = (threadgroup half *)buf, *sb = sa + 64 * 64; threadgroup half cbk[16]; threadgroup uint4 raw[144];
+    GJob jl = j;
+    gemm_tile<TT, NT>(W, S, jl, tg.x * 64, tg.y * TT, j.T, nullptr, tid, sg, sa, sb, buf, cbk, raw);
 }
+template [[host_name("k_gemm64")]] kernel void k_gemm<64, 128>(device const uchar *, device float *, constant GJob &, uint2, uint, uint);
+template [[host_name("k_gemm128")]] kernel void k_gemm<128, 256>(device const uchar *, device float *, constant GJob &, uint2, uint, uint);
 
 #ifndef MT
 #define MT 32         /* tokens per expert GEMM tile */
 #endif
 // ---------------- prefill MoE: counting-sort planner (one threadgroup of 1024) ----------------
-struct PPlanB { uint B, ids, slotmap, slottok, tiles, mt; };
+struct PPlanB { uint B, ids, slotmap, slottok, tiles, mt, big; };	/* big-token tiles first (list at tiles), remainders in mt-token tiles (list at tiles + 3072) */
 kernel void k_moe_plan_big(device float *S [[buffer(0)]], device uint *ARGS [[buffer(1)]], constant PPlanB &p [[buffer(2)]],
                            uint tid [[thread_index_in_threadgroup]]) {
     threadgroup atomic_uint cnt[NEXP], fill[NEXP]; threadgroup uint off[NEXP];
@@ -846,39 +851,40 @@ kernel void k_moe_plan_big(device float *S [[buffer(0)]], device uint *ARGS [[bu
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint i = tid; i < ns; i += 1024) { uint e = ids[i]; if (e < NEXP) atomic_fetch_add_explicit(&cnt[e], 1, memory_order_relaxed); }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0) { uint o = 0, nt = 0;
-        for (uint e = 0; e < NEXP; e++) { uint c = atomic_load_explicit(&cnt[e], memory_order_relaxed); off[e] = o;
-            for (uint s0 = 0; s0 < c; s0 += p.mt) { tl[nt * 3] = e; tl[nt * 3 + 1] = o + s0; tl[nt * 3 + 2] = min(p.mt, c - s0); nt++; }
+    if (tid == 0) { uint o = 0, nb = 0, nt = 0;
+        for (uint e = 0; e < NEXP; e++) { uint c = atomic_load_explicit(&cnt[e], memory_order_relaxed), s0 = 0; off[e] = o;
+            for (; p.big && s0 < c; s0 += p.big) { tl[nb * 3] = e; tl[nb * 3 + 1] = o + s0; tl[nb * 3 + 2] = min(p.big, c - s0); nb++; }
+            for (; s0 < c; s0 += p.mt) { tl[3072 + nt * 3] = e; tl[3072 + nt * 3 + 1] = o + s0; tl[3072 + nt * 3 + 2] = min(p.mt, c - s0); nt++; }
             o += c; }
-        ARGS[0] = (2 * NFF + 63) / 64; ARGS[1] = nt; ARGS[2] = 1; ARGS[3] = (NE + 63) / 64; ARGS[4] = nt; ARGS[5] = 1; }
+        for (uint ph = 0; ph < 2; ph++) { uint rows = ph ? (NE + 63) / 64 : (2 * NFF + 63) / 64;	/* per phase: big list, small list */
+            ARGS[ph * 6] = rows; ARGS[ph * 6 + 1] = nb; ARGS[ph * 6 + 2] = 1; ARGS[ph * 6 + 3] = rows; ARGS[ph * 6 + 4] = nt; ARGS[ph * 6 + 5] = 1; } }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint i = tid; i < ns; i += 1024) { uint e = ids[i];
         if (e < NEXP) { uint pos = off[e] + atomic_fetch_add_explicit(&fill[e], 1, memory_order_relaxed); stok[pos] = i / NUSED; smap[i] = pos; } }
 }
 // grouped expert GEMM: grid (row tiles, token tiles); phase 0 = gate_up (gather token rows), 1 = down (SITU on gate_up rows)
 struct PMoeG { uint layer, phase, xm, gu, dn, slottok, tiles, act; };
-template <uint TMT> kernel void k_gemm_moe(device const uchar *W [[buffer(0)]], device float *S [[buffer(1)]], device const ETab *ET [[buffer(2)]],
+template <uint TMT, uint NT> kernel void k_gemm_moe(device const uchar *W [[buffer(0)]], device float *S [[buffer(1)]], device const ETab *ET [[buffer(2)]],
                        constant PMoeG &p [[buffer(3)]],
                        uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
-    threadgroup float buf[64 * GT];   /* sized for the largest tile */
-    threadgroup half *sa = (threadgroup half *)buf, *sb = sa + 64 * 64; threadgroup float *so = buf;
+    threadgroup float buf[(64 * 64 + TMT * 64) / 2 > 64 * 64 ? (64 * 64 + TMT * 64) / 2 : 64 * 64];	/* sa + sb, reused as the output stage */
+    threadgroup half *sa = (threadgroup half *)buf, *sb = sa + 64 * 64; threadgroup half cbk[16]; threadgroup uint4 raw[144];
     device const uint *tl = (device const uint *)(S + p.tiles) + tg.y * 3;
     uint e = tl[0], start = tl[1], count = tl[2];
     device const ETab &et = ET[p.layer * NEXP + e];
     GJob j; for (uint i = 0; i < 16; i++) j.tbl[i] = et.tbl[i];
-    j.e2m1 = et.e2m1; j.xidx = 0; j.yidx = 0; j.T = count;
+    j.e2m1 = et.e2m1; j.T = count;
     device const uint *xr = nullptr;
     if (p.phase == 0) { j.woff_lo = et.gu_lo; j.woff_hi = et.gu_hi; j.N = 2 * NFF; j.K = NE; j.gscale = et.gsg;
-        j.x = p.xm; j.xs = NE; j.act = 0; xr = (device const uint *)(S + p.slottok) + start;
-        j.y = p.gu + start * 2 * NFF; j.ys = 2 * NFF; }
+        j.x = p.xm; j.xs = NE; xr = (device const uint *)(S + p.slottok) + start; j.y = p.gu + start * 2 * NFF; j.ys = 2 * NFF; }	/* xm, act: half */
     else { j.woff_lo = et.dn_lo; j.woff_hi = et.dn_hi; j.N = NE; j.K = NFF; j.gscale = et.gsd;
-        j.x = p.act + start * NFF; j.xs = NFF; j.act = 0; j.y = p.dn + start * NE; j.ys = NE; }
+        j.x = p.act + start * NFF / 2; j.xs = NFF; j.y = p.dn + start * NE; j.ys = NE; }
     if (tg.x * 64 >= j.N) return;
-    threadgroup half cbk[16]; threadgroup uint4 raw[16 * 9];
-    gemm_tile<TMT>(W, S, j, tg.x * 64, 0, count, xr, nullptr, tid, sg, sa, sb, so, cbk, raw);
+    gemm_tile<TMT, NT>(W, S, j, tg.x * 64, 0, count, xr, tid, sg, sa, sb, buf, cbk, raw);
 }
-template [[host_name("k_gemm_moe8")]] kernel void k_gemm_moe<8>(device const uchar *, device float *, device const ETab *, constant PMoeG &, uint2, uint, uint);
-template [[host_name("k_gemm_moe32")]] kernel void k_gemm_moe<32>(device const uchar *, device float *, device const ETab *, constant PMoeG &, uint2, uint, uint);
+template [[host_name("k_gemm_moe8")]] kernel void k_gemm_moe<8, 128>(device const uchar *, device float *, device const ETab *, constant PMoeG &, uint2, uint, uint);
+template [[host_name("k_gemm_moe32")]] kernel void k_gemm_moe<32, 128>(device const uchar *, device float *, device const ETab *, constant PMoeG &, uint2, uint, uint);
+template [[host_name("k_gemm_moe128")]] kernel void k_gemm_moe<128, 256>(device const uchar *, device float *, device const ETab *, constant PMoeG &, uint2, uint, uint);
 
 // ---------------- prefill router: fp32 GEMM with simdgroup float matrices ----------------
 // L[t][e] = sum_k Wr[e][k] X[t][k]; tile 64 experts x 32 tokens, K step 32; 128 threads
@@ -988,9 +994,15 @@ kernel void k_attn_prefill(device const half *K [[buffer(0)]], device const half
     }
 }
 
-struct PSituA { uint gu, act, n; };
+struct PSituA { uint gu, act, n; };	/* act: half */
 kernel void k_situ_all(device float *S [[buffer(0)]], constant PSituA &p [[buffer(1)]], uint i [[thread_position_in_grid]]) {
     if (i >= p.n) return; uint r = i / NFF, c = i % NFF;
     float g = S[p.gu + r * 2 * NFF + c], up = S[p.gu + r * 2 * NFF + NFF + c];
-    S[p.act + r * NFF + c] = SITU_BETA * tanh(g / SITU_BETA) / (1.0f + exp(-g)) * (SITU_LB * tanh(up / SITU_LB));
+    ((device half *)(S + p.act))[r * NFF + c] = half(SITU_BETA * tanh(g / SITU_BETA) / (1.0f + exp(-g)) * (SITU_LB * tanh(up / SITU_LB)));
+}
+// rows of fp32 -> fp16 (GEMM inputs): dst half rows of n, stride n
+struct PHalf { uint src, ss, dst, n, rows; };
+kernel void k_tohalf(device float *S [[buffer(0)]], constant PHalf &p [[buffer(1)]], uint i [[thread_position_in_grid]]) {
+    if (i >= p.n / 4 * p.rows) return; uint r = i / (p.n / 4), c = i % (p.n / 4);
+    ((device half4 *)(S + p.dst))[i] = half4(*(device const float4 *)(S + p.src + r * p.ss + c * 4));
 }

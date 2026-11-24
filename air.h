@@ -1,4 +1,5 @@
 /* air.h - Inkling 2 Mini: model constants, weight file layout, gpu interface. */
+#pragma once
 #include <stdint.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -9,7 +10,7 @@ enum {
 	NPHYS = 24, NVIS = 48, CORE0 = 6, CORE1 = 18, NPASS = 3,
 	SWA = 1024, HIST = 16, CONVW = 2 * KVD + 2 * NE,
 	NVOCAB = 200058, NVOCAB4 = 200060, NTOK = 200058,
-	MAXB = 16, PMAX = 1024, TOPC = 16,
+	MAXB = 16, PMAX = 2048, TOPC = 16,
 	/* drafter */
 	DL = 3, DBLOCK = 8, DFF = 9216, DRANK = 256, NFEAT = 4, CTXRING = 64, DCAND = 64,
 };

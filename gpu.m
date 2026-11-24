@@ -24,24 +24,24 @@ static uint32_t invf, mfree;
 
 #define PIPES X(copy) X(rmsnorm) X(mix) X(ctl_prep) X(ctl_combine) X(ctl_a) X(ctl_b) X(gemv) X(ring_write) X(conv_kv) \
 	X(qr) X(attn) X(attn8) X(attn_merge) X(post) X(ffn_front) X(topk) X(moe_plan) X(moe_combine) X(top_a) X(top_b) \
-	X(dfuse) X(headnorm_rope) X(swiglu) X(add) X(gemm) X(moe_plan_big) X(router_gemm) X(attn_prefill) X(situ_all)
+	X(dfuse) X(headnorm_rope) X(swiglu) X(add) X(gemm64) X(gemm128) X(moe_plan_big) X(router_gemm) X(attn_prefill) X(situ_all) X(tohalf)
 #define X(n) static id<MTLComputePipelineState> P_##n;
 PIPES
 #undef X
-static id<MTLComputePipelineState> P_mm[5], P_mmbig[5], P_mmmoe, P_gmoe8, P_gmoe32;
+static id<MTLComputePipelineState> P_mm[5], P_mmbig[5], P_mmmoe, P_gmoe8, P_gmoe32, P_gmoe128;
 
 /* scratch layout (float offsets), one for decode (MAXB rows) and one for prefill (PMAX rows) */
 typedef struct {
 	uint32_t cur, ffn, prec, bankl, blk, preb, bank, msg, inp, hr, h2, cg, cf, q, kk, vv, r, gate, sink, dk, dv,
-		att, o, xm, ym, log, ids, wts, gu, act, dn, smap, pm, pl, pacc, x, lg, part, feat, stok, tiles;
+		att, o, xm, ym, log, xh, ids, wts, gu, act, dn, smap, pm, pl, pacc, x, lg, part, feat, stok, tiles;
 } lay;
 static lay LD, LP, *Y = &LD;
 static uint32_t DX, DH, DQ, DKK, DVV, DATT, DO, DG, DU, DC, CTXR;
-enum { BLKS = 16 * NE, ATTCH = 512, NTOPCH = 64, MAXJ = 160, JOBCAP = 60000, CNTCAP = 8192 };
+enum { BLKS = 8 * NE, ATTCH = 512, NTOPCH = 64, MAXJ = 160, JOBCAP = 60000, CNTCAP = 8192 };
 
 typedef struct { uint32_t lo, hi, N, K; float gs; uint32_t B, x0, x1, x2, x3, y, ys, tile0; signed char tbl[16]; uint32_t e2m1, act, ngi; } job;
 typedef struct { uint32_t gulo, guhi, dnlo, dnhi; float gsg, gsd; uint32_t e2m1; signed char tbl[16]; uint32_t pad; } etab;
-typedef struct { uint32_t lo, hi, N, K; float gs; uint32_t e2m1; signed char tbl[16]; uint32_t x, xs, y, ys, T, xidx, yidx, act; } gjob;
+typedef struct { uint32_t lo, hi, N, K; float gs; uint32_t e2m1; signed char tbl[16]; uint32_t x, xs, y, ys, T; } gjob;
 typedef struct { uint32_t lo, hi; float gs; uint32_t e2m1; signed char tbl[16]; } cmat;
 
 static size_t sused;
@@ -52,11 +52,11 @@ static void layout(lay *l, int mb, int lgrows, int slots) {
 	l->msg = salloc(mb * 4 * NE); l->inp = salloc(mb * 3 * NE); l->h2 = salloc(mb * 6 * NE); l->hr = salloc(mb * 3 * RANK);
 	l->cg = salloc(mb * 3 * NE); l->cf = salloc(mb * 3 * NE); l->q = salloc(mb * QD); l->kk = salloc(mb * KVD); l->vv = salloc(mb * KVD);
 	l->r = salloc(mb * NH * NREL); l->gate = salloc(mb * QD); l->sink = salloc(mb * NH); l->dk = salloc(mb * 32); l->dv = salloc(mb * 32);
-	l->att = salloc(mb * QD); l->o = salloc(mb * NE); l->xm = salloc(mb * NE); l->ym = salloc(mb * NE); l->log = salloc(mb * NEXP);
+	l->att = salloc(mb * QD); l->xh = salloc((size_t)mb * 3 * 2 * NE / 2); l->o = salloc(mb * NE); l->xm = salloc(mb * NE); l->ym = salloc(mb * NE); l->log = salloc(mb * NEXP);
 	l->ids = salloc(mb * NUSED); l->wts = salloc(mb * NUSED); l->gu = salloc((size_t)slots * 2 * NFF); l->act = salloc((size_t)slots * NFF);
 	l->dn = salloc((size_t)slots * NE); l->smap = salloc(mb * NUSED); l->pm = salloc(NKV * ATTCH * 24); l->pl = salloc(NKV * ATTCH * 24);
 	l->pacc = salloc((size_t)NKV * ATTCH * 24 * HD); l->x = salloc(mb * NE); l->lg = salloc((size_t)lgrows * (NVOCAB + 3));
-	l->part = salloc(MAXB * NTOPCH * 64 * 2); l->feat = salloc(mb * 4 * NE); l->stok = salloc(mb * NUSED); l->tiles = salloc(3 * 2048);
+	l->part = salloc(MAXB * NTOPCH * 64 * 2); l->feat = salloc(mb * 4 * NE); l->stok = salloc(mb * NUSED); l->tiles = salloc(3 * 3072);
 }
 
 static id<MTLComputePipelineState> mkpipe(id<MTLLibrary> lib, const char *name) {
@@ -78,7 +78,7 @@ int gpu_init(int max_ctx) {
 	PIPES
 #undef X
 	for (int b = 1; b <= 4; b++) { char n[16]; snprintf(n, sizeof n, "mm4_%d", b); P_mm[b] = mkpipe(lib, n); snprintf(n, sizeof n, "mm4big_%d", b); P_mmbig[b] = mkpipe(lib, n); }
-	P_mmmoe = mkpipe(lib, "mm4_moe"); P_gmoe8 = mkpipe(lib, "k_gemm_moe8"); P_gmoe32 = mkpipe(lib, "k_gemm_moe32");
+	P_mmmoe = mkpipe(lib, "mm4_moe"); P_gmoe8 = mkpipe(lib, "k_gemm_moe8"); P_gmoe32 = mkpipe(lib, "k_gemm_moe32"); P_gmoe128 = mkpipe(lib, "k_gemm_moe128");
 
 	bW = [dev newBufferWithBytesNoCopy:AR length:(W->narena + 16383) & ~(size_t)16383 options:MTLResourceStorageModeShared deallocator:nil];
 	if (!bW) { fprintf(stderr, "air: cannot map weights\n"); return -1; }
@@ -101,7 +101,7 @@ int gpu_init(int max_ctx) {
 		*t = (etab){ (uint32_t)g->off, (uint32_t)(g->off >> 32), (uint32_t)d->off, (uint32_t)(d->off >> 32), g->gs, d->gs, !g->nl };
 		memcpy(t->tbl, g->nl ? NL : E2, 16);
 	}
-	bJobs = buf(sizeof(job) * JOBCAP); bCnt = buf(4 * CNTCAP); bArgs = buf(4 * 3 * 2 * NVIS);
+	bJobs = buf(sizeof(job) * JOBCAP); bCnt = buf(4 * CNTCAP); bArgs = buf(4 * 3 * 4 * NVIS);
 	bCand = buf(4 * MAXB * TOPC); bDCand = buf(4 * DBLOCK * DCAND);
 	for (int v = 0; v < NVIS; v++) {
 		cap[v] = W->swa[v] ? (max_ctx < RING ? max_ctx : RING) : max_ctx;
@@ -187,13 +187,26 @@ static void mm_jobs(const mmp *M, int n, int b0, int nb) {
 }
 /* prefill: simdgroup-matrix GEMM, 64 rows x 64 tokens per threadgroup */
 static void gemm(const mat *w, uint32_t x, int xs, uint32_t y, int ys, int T) {
-	gjob j = { (uint32_t)w->off, (uint32_t)(w->off >> 32), w->N, w->K, w->gs, !w->nl, {0}, x, xs, y, ys, T, 0, 0, 0 };
+	gjob j = { (uint32_t)w->off, (uint32_t)(w->off >> 32), w->N, w->K, w->gs, !w->nl, {0}, x, xs, y, ys, T };
 	memcpy(j.tbl, w->nl ? NL : E2, 16);
-	set(P_gemm); arg(0, bW); arg(1, bS); P(2, j); grid2((w->N + 63) / 64, (T + 63) / 64, 128);
+	if (T >= 128) { set(P_gemm128); arg(0, bW); arg(1, bS); P(2, j); grid2((w->N + 63) / 64, (T + 127) / 128, 256); }
+	else { set(P_gemm64); arg(0, bW); arg(1, bS); P(2, j); grid2((w->N + 63) / 64, (T + 63) / 64, 128); }
 }
 static int pf;	/* encoding a prefill */
+static uint32_t tohalf(uint32_t src, int ss, uint32_t dst, int n, int rows) {
+	struct { uint32_t src, ss, dst, n, rows; } p = { src, ss, dst, n, rows };
+	set(P_tohalf); arg(0, bS); P(1, p); threads(n / 4 * rows); return dst;
+}
 static void mm(const mmp *M, int n, int B) {
-	if (pf) { for (int i = 0; i < n; i++) gemm(M[i].w, M[i].x0, M[i].xs, M[i].y0, M[i].ys, B); return; }
+	if (pf) {	/* each distinct input converted to fp16 once */
+		uint32_t src[8], dst[8], at = Y->xh; int ns = 0;
+		for (int i = 0; i < n; i++) {
+			int k = 0; while (k < ns && src[k] != M[i].x0) k++;
+			if (k == ns) { src[ns] = M[i].x0; dst[ns++] = tohalf(M[i].x0, M[i].xs, at, M[i].w->K, B); at += (uint32_t)M[i].w->K * B / 2; }
+			gemm(M[i].w, dst[k], M[i].w->K, M[i].y0, M[i].ys, B);
+		}
+		return;
+	}
 	for (int b0 = 0; b0 < B; b0 += 4) mm_jobs(M, n, b0, B - b0 < 4 ? B - b0 : 4);
 }
 static void mm1(const mat *w, uint32_t x, int xs, uint32_t y, int ys, int B) { mmp p = { w, x, xs, y, ys }; mm(&p, 1, B); }
@@ -391,25 +404,28 @@ static void forward(const int *tok, int B, int pos0, int last) {
 		{ struct { uint32_t logit, bias, ids, wts; float ws; } p = { Y->log, L->ebias, Y->ids, Y->wts, WSCALE };
 		  set(P_topk); arg(0, bS); arg(1, bM); P(2, p); grid(B, NEXP); }
 		/* experts */
-		if (pf) {	/* counting sort by expert, grouped GEMMs over token tiles */
-			const int mt = B * NUSED / NEXP < 12 ? 8 : 32;
-			struct { uint32_t B, ids, smap, stok, tiles, mt; } pp = { B, Y->ids, Y->smap, Y->stok, Y->tiles, mt };
-			set(P_moe_plan_big); arg(0, bS); [E setBuffer:bArgs offset:4 * 3 * 2 * v atIndex:1]; P(2, pp); grid(1, 1024);
+		if (pf) {	/* counting sort by expert; grouped GEMMs over full 128-token tiles, then the remainders */
+			const int per = B * NUSED / NEXP, mt = per < 12 ? 8 : 32, big = per >= 32 ? 128 : 0;
+			struct { uint32_t B, ids, smap, stok, tiles, mt, big; } pp = { B, Y->ids, Y->smap, Y->stok, Y->tiles, mt, big };
+			set(P_moe_plan_big); arg(0, bS); [E setBuffer:bArgs offset:4 * 12 * v atIndex:1]; P(2, pp); grid(1, 1024);
+			uint32_t xmh = tohalf(Y->xm, NE, Y->xh, NE, B);
 			for (int ph = 0; ph < 2; ph++) {
 				if (ph) { struct { uint32_t gu, act, n; } s = { Y->gu, Y->act, B * NUSED * NFF }; set(P_situ_all); arg(0, bS); P(1, s); threads(B * NUSED * NFF); }
-				struct { uint32_t layer, ph, xm, gu, dn, stok, tiles, act; } g = { ip, ph, Y->xm, Y->gu, Y->dn, Y->stok, Y->tiles, Y->act };
-				set(mt == 8 ? P_gmoe8 : P_gmoe32); arg(0, bW); arg(1, bS); arg(2, bET); P(3, g);
-				[E dispatchThreadgroupsWithIndirectBuffer:bArgs indirectBufferOffset:4 * 3 * (2 * v + ph) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+				for (int sm = !big; sm < 2; sm++) {
+					struct { uint32_t layer, ph, xm, gu, dn, stok, tiles, act; } g = { ip, ph, xmh, Y->gu, Y->dn, Y->stok, Y->tiles + sm * 3072, Y->act };
+					set(!sm ? P_gmoe128 : mt == 8 ? P_gmoe8 : P_gmoe32); arg(0, bW); arg(1, bS); arg(2, bET); P(3, g);
+					[E dispatchThreadgroupsWithIndirectBuffer:bArgs indirectBufferOffset:4 * (12 * v + 6 * ph + 3 * sm) threadsPerThreadgroup:MTLSizeMake(sm ? 128 : 256, 1, 1)];
+				}
 			}
 		} else {	/* job list of (expert, <= 4 positions) built on the gpu */
 			if (njobs + 2 * MAXJ > JOBCAP || ncnt + 9 > CNTCAP) { fprintf(stderr, "air: job buffer full\n"); exit(1); }
 			struct { uint32_t B, layer, ids, xm, gu, act, dn, smap, jobs, counts, args, maxjobs; } p = { B, ip, Y->ids, Y->xm, Y->gu, Y->act, Y->dn, Y->smap, 0, 0, 0, MAXJ };
 			set(P_moe_plan); arg(0, bS); arg(1, bET); [E setBuffer:bJobs offset:sizeof(job) * njobs atIndex:2];
-			[E setBuffer:bCnt offset:4 * ncnt atIndex:3]; [E setBuffer:bArgs offset:4 * 3 * 2 * v atIndex:4]; P(5, p); grid(1, 128);
+			[E setBuffer:bCnt offset:4 * ncnt atIndex:3]; [E setBuffer:bArgs offset:4 * 12 * v atIndex:4]; P(5, p); grid(1, 128);
 			for (int ph = 0; ph < 2; ph++) {
 				set(P_mmmoe); [E setThreadgroupMemoryLength:(size_t)(B < 4 ? B : 4) * (ph ? NFF : NE) * 2 atIndex:0]; arg(0, bW); arg(1, bS); arg(2, bS);
 				[E setBuffer:bJobs offset:sizeof(job) * (njobs + ph * MAXJ) atIndex:3]; [E setBuffer:bCnt offset:4 * (ncnt + ph) atIndex:4];
-				[E dispatchThreadgroupsWithIndirectBuffer:bArgs indirectBufferOffset:4 * 3 * (2 * v + ph) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+				[E dispatchThreadgroupsWithIndirectBuffer:bArgs indirectBufferOffset:4 * (12 * v + 3 * ph) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 			}
 			njobs += 2 * MAXJ; ncnt += 9;
 		}
