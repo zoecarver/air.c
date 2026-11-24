@@ -15,6 +15,7 @@ using namespace metal;
 #define NFF 1152
 #define NEXP 128
 #define NUSED 8
+#define RANK 64
 #define SITU_BETA 4.0f
 #define SITU_LB 25.0f
 
@@ -382,8 +383,8 @@ kernel void k_topk(device float *S [[buffer(0)]], device const float *M [[buffer
     topk8(sel, prob, e, ((device uint *)(S + p.ids)) + b * NUSED, S + p.wts + b * NUSED, p.wscale, rv, ri, chosen);
 }
 
-struct Job { uint woff_lo, woff_hi, N, K; float gscale; uint B, x0, x1, x2, x3, yoff, ystride, tile0; char tbl[16]; uint e2m1, pad[2]; };
-struct ETab { uint gu_lo, gu_hi, dn_lo, dn_hi; float gsg, gsd; uint e2m1; char tbl[16]; uint pad; };
+struct Job { uint woff_lo, woff_hi, N, K; float gscale; uint B, x0, x1, x2, x3, yoff, ystride, tile0; char tbl[16]; uint e2m1, act; };	/* act: input is [gate|up], apply SITU */
+struct ETab { uint gu_lo, gu_hi, dn_lo, dn_hi; float gsg, gsd; uint e2m1; char tbl[16]; };
 // one thread builds the expert union and the job lists (gate_up and down, per B class 1..4)
 struct PPlan { uint B, layer, ids, xm, gu, act, dn, slotmap, jobs, counts, args, maxjobs; };
 kernel void k_moe_plan(device float *S [[buffer(0)]], device const ETab *ET [[buffer(1)]], device Job *J [[buffer(2)]],
@@ -408,9 +409,9 @@ kernel void k_moe_plan(device float *S [[buffer(0)]], device const ETab *ET [[bu
         for (uint j = s0; j < ns && k < 16; j++) if (ex[j] == e) lst[k++] = j;
         for (uint c0 = 0; c0 < c; c0 += 4) {
             uint nb = min(4u, c - c0), row = rowb + c0, ji = jobb + c0 / 4;
-            Job g; g.woff_lo = et.gu_lo; g.woff_hi = et.gu_hi; g.N = 2 * NFF; g.K = NE; g.gscale = et.gsg; g.B = nb; g.e2m1 = et.e2m1; g.pad[0] = 0; g.pad[1] = 0;
+            Job g; g.woff_lo = et.gu_lo; g.woff_hi = et.gu_hi; g.N = 2 * NFF; g.K = NE; g.gscale = et.gsg; g.B = nb; g.e2m1 = et.e2m1; g.act = 0;
             for (uint i = 0; i < 16; i++) g.tbl[i] = et.tbl[i];
-            Job d = g; d.woff_lo = et.dn_lo; d.woff_hi = et.dn_hi; d.N = NE; d.K = NFF; d.gscale = et.gsd; d.pad[0] = 1;
+            Job d = g; d.woff_lo = et.dn_lo; d.woff_hi = et.dn_hi; d.N = NE; d.K = NFF; d.gscale = et.gsd; d.act = 1;
             uint xs[4] = {0, 0, 0, 0}, gs[4] = {0, 0, 0, 0};
             for (uint i = 0; i < nb; i++) { uint sl = lst[c0 + i]; xs[i] = p.xm + (sl / NUSED) * NE; gs[i] = p.gu + (row + i) * 2 * NFF; slotmap[sl] = row + i; }
             g.x0 = xs[0]; g.x1 = xs[1]; g.x2 = xs[2]; g.x3 = xs[3]; g.yoff = p.gu + row * 2 * NFF; g.ystride = 2 * NFF; g.tile0 = ji * TG;
@@ -445,7 +446,7 @@ template <uint FB> void mm4_body(device const uchar *W, device const float *X, d
   const uint B = FB; uint KB = jb.K / 16; ulong woff = ((ulong)jb.woff_hi << 32) | jb.woff_lo;
   uint xo0[4] = { jb.x0, jb.x1, jb.x2, jb.x3 };
   float xs[4] = {1, 1, 1, 1};
-  if (jb.pad[0]) {   /* SITU staging (|act| <= 100: no scaling needed) */
+  if (jb.act) {   /* SITU staging (|act| <= 100: no scaling needed) */
     for (uint i = tid; i < B * jb.K; i += 256) { uint p = i / jb.K, k = i % jb.K; float g = X[xo0[p] + k], up = X[xo0[p] + jb.K + k];
       float act = SITU_BETA * tanh(g / SITU_BETA) / (1.0f + exp(-g)) * (SITU_LB * tanh(up / SITU_LB)); tx[p * jb.K + k] = half(act); }
   } else {
@@ -459,7 +460,7 @@ template <uint FB> void mm4_body(device const uchar *W, device const float *X, d
     for (uint i = tid; i < B * jb.K; i += 256) { uint p = i / jb.K, k = i % jb.K; tx[p * jb.K + k] = half(X[xo0[p] + k] / xs[p]); }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  const uint ngi = jb.pad[1] ? jb.pad[1] : 4;      /* row-groups per simdgroup (tile = 32*ngi rows) */
+  const uint ngi = 4;      /* row groups per simdgroup (tile = 32 * ngi row groups) */
   for (uint gi = 0; gi < ngi; gi++) {
     uint g = (tg - jb.tile0) * 8 * ngi + gi * 8 + sg; if (g * 4 >= jb.N) break;
     device const uchar *base = W + woff + (ulong)g * KB * 36;
@@ -687,7 +688,6 @@ kernel void k_add(device float *S [[buffer(0)]], constant PAdd &p [[buffer(1)]],
     if (i >= p.n) return; S[p.x + i] += S[p.y + i];
 }
 
-#define RANK 64
 struct CMat { uint lo, hi; float gs; uint e2m1; char tbl[16]; };
 struct PCtlF { uint cur, cbs, cjs, msg, mbs, mjs, B; CMat mt[9]; };
 inline void ctl_lut(threadgroup half2 *lut, constant CMat &c, uint tid) {
@@ -836,9 +836,6 @@ template <uint TT, uint NT> kernel void k_gemm(device const uchar *W [[buffer(0)
 template [[host_name("k_gemm64")]] kernel void k_gemm<64, 128>(device const uchar *, device float *, constant GJob &, uint2, uint, uint);
 template [[host_name("k_gemm128")]] kernel void k_gemm<128, 256>(device const uchar *, device float *, constant GJob &, uint2, uint, uint);
 
-#ifndef MT
-#define MT 32         /* tokens per expert GEMM tile */
-#endif
 // ---------------- prefill MoE: counting-sort planner (one threadgroup of 1024) ----------------
 struct PPlanB { uint B, ids, slotmap, slottok, tiles, mt, big; };	/* big-token tiles first (list at tiles), remainders in mt-token tiles (list at tiles + 3072) */
 kernel void k_moe_plan_big(device float *S [[buffer(0)]], device uint *ARGS [[buffer(1)]], constant PPlanB &p [[buffer(2)]],

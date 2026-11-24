@@ -39,8 +39,8 @@ static lay LD, LP, *Y = &LD;
 static uint32_t DX, DH, DQ, DKK, DVV, DATT, DO, DG, DU, DC, CTXR;
 enum { BLKS = 8 * NE, ATTCH = 512, NTOPCH = 64, MAXJ = 160, JOBCAP = 60000, CNTCAP = 8192 };
 
-typedef struct { uint32_t lo, hi, N, K; float gs; uint32_t B, x0, x1, x2, x3, y, ys, tile0; signed char tbl[16]; uint32_t e2m1, act, ngi; } job;
-typedef struct { uint32_t gulo, guhi, dnlo, dnhi; float gsg, gsd; uint32_t e2m1; signed char tbl[16]; uint32_t pad; } etab;
+typedef struct { uint32_t lo, hi, N, K; float gs; uint32_t B, x0, x1, x2, x3, y, ys, tile0; signed char tbl[16]; uint32_t e2m1, act; } job;
+typedef struct { uint32_t gulo, guhi, dnlo, dnhi; float gsg, gsd; uint32_t e2m1; signed char tbl[16]; } etab;
 typedef struct { uint32_t lo, hi, N, K; float gs; uint32_t e2m1; signed char tbl[16]; uint32_t x, xs, y, ys, T; } gjob;
 typedef struct { uint32_t lo, hi; float gs; uint32_t e2m1; signed char tbl[16]; } cmat;
 
@@ -171,7 +171,7 @@ static void mm_jobs(const mmp *M, int n, int b0, int nb) {
 		const mat *w = M[i].w; uint32_t x[4] = { 0 };
 		for (int k = 0; k < nb; k++) x[k] = M[i].x0 + (b0 + k) * M[i].xs;
 		g[i] = (job){ (uint32_t)w->off, (uint32_t)(w->off >> 32), w->N, w->K, w->gs, nb, x[0], x[1], x[2], x[3],
-			M[i].y0 + b0 * M[i].ys, M[i].ys, tiles, {0}, !w->nl, 0, 4 };
+			M[i].y0 + b0 * M[i].ys, M[i].ys, tiles, {0}, !w->nl, 0 };
 		memcpy(g[i].tbl, w->nl ? NL : E2, 16);
 		tiles += (w->N / 4 + 31) / 32;
 		if (nb * (int)w->K > 14336) big = 1;

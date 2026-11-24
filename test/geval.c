@@ -21,7 +21,7 @@ int main(int ac, char **av) {
 	double t0 = now();
 	for (int i = i0; i < t.n; i += 3) {
 		int b = t.n - i < 3 ? t.n - i : 3;
-		fwd(t.p + i, b, 0, best, NULL);
+		fwd(t.p + i, b, 0, best);
 		for (int k = 0; k < b; k++) { if (fread(&r, sizeof r, 1, fr) != 1) goto done; agree += best[k] == r.c[0].id; cnt++; }
 	}
 done:

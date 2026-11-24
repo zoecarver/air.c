@@ -9,7 +9,6 @@
 #include <math.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
-#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -431,11 +430,11 @@ static int prep(const char *dir, const char *out) {
 	  for (size_t i = 0; i < (size_t)NE * DRANK; i++) f[i] = tf(h, i);
 	  w.hout = blob(f, sizeof(float) * NE * DRANK); free(f); }
 	{ snprintf(p, sizeof p, "%s/tiktoken/tokenizer.model", dir); FILE *f = fopen(p, "r"); if (!f) die("cannot open %s", p);
-	  str bytes = { 0 }; uint32_t *off = xmalloc(4 * (NTOK + 1)); char line[4096]; int n = 0;
-	  while (n < NTOK && fgets(line, sizeof line, f)) { off[n++] = (uint32_t)bytes.n; char *sp = strchr(line, ' '); if (sp) *sp = 0; b64(line, &bytes); }
-	  fclose(f); if (n != NTOK) die("tokenizer: %d tokens", n);
-	  off[NTOK] = (uint32_t)bytes.n;
-	  w.vocab = blob(off, 4 * (NTOK + 1)); w.nvocab = bytes.n; blob(bytes.p, bytes.n); sfree(&bytes); free(off); }
+	  str bytes = { 0 }; uint32_t *off = xmalloc(4 * (NVOCAB + 1)); char line[4096]; int n = 0;
+	  while (n < NVOCAB && fgets(line, sizeof line, f)) { off[n++] = (uint32_t)bytes.n; char *sp = strchr(line, ' '); if (sp) *sp = 0; b64(line, &bytes); }
+	  fclose(f); if (n != NVOCAB) die("tokenizer: %d tokens", n);
+	  off[NVOCAB] = (uint32_t)bytes.n;
+	  w.vocab = blob(off, 4 * (NVOCAB + 1)); w.nvocab = bytes.n; blob(bytes.p, bytes.n); sfree(&bytes); free(off); }
 	pw(&w, sizeof w, 0);
 	if (ftruncate(ofd, fpos)) die("truncate failed");
 	close(ofd);
@@ -461,7 +460,7 @@ static void load(const char *path) {
 	if (m == MAP_FAILED) die("cannot map %s", path);
 	SM = xmalloc(w.nsmalls * 4); memcpy(SM, m + w.smalls, w.nsmalls * 4);
 	Q8E = m + w.emb; Q8U = m + w.unemb; W1 = (uint16_t *)(m + w.w1); JNT = (__fp16 *)(m + w.joint); HOUT = (float *)(m + w.hout);
-	VOFF = (uint32_t *)(m + w.vocab); VOC = m + w.vocab + (((size_t)4 * (NTOK + 1) + 16383) & ~(size_t)16383);
+	VOFF = (uint32_t *)(m + w.vocab); VOC = m + w.vocab + (((size_t)4 * (NVOCAB + 1) + 16383) & ~(size_t)16383);
 	fprintf(stderr, "loaded %s (%.1f GB) in %.1f s\n", path, st.st_size / 1e9, now() - t0);
 }
 
@@ -558,7 +557,7 @@ static struct {
 enum { NDRAFT = 3, SLACK = RING - SWA - MAXB };
 
 /* forward B tokens at E.n; best[b] = argmax by exact (q8) rescoring of the 16 gpu candidates */
-static void fwd(const int *t, int B, int last, int *best, float *bestv) {
+static void fwd(const int *t, int B, int last, int *best) {
 	int cand[MAXB * TOPC]; float row[NE];
 	gpu_forward(t, B, E.n, last, cand);
 	const float *x = gpu_x();
@@ -569,7 +568,7 @@ static void fwd(const int *t, int B, int last, int *best, float *bestv) {
 			q8row(W->unemb, c, row); float v = dot(row, x + b * NE, NE);
 			if (v > bv || (v == bv && c < bi)) { bv = v; bi = c; }
 		}
-		best[b] = bi; if (bestv) bestv[b] = bv;
+		best[b] = bi;
 	}
 	for (int b = 0; b < B; b++) if (E.n + b < E.max_ctx + 64) E.hist[E.n + b] = t[b];
 	E.n += B;
@@ -593,7 +592,7 @@ static void prefill(const int *t, int n) {
 		}
 	} else for (int i = 0; i < na; ) {	/* short: decode path, 12 at a time (conv ring holds 16) */
 		int b = na - i < 12 ? na - i : 12, best[MAXB], p0 = E.n;
-		fwd(all + i, b, 1, best, NULL);
+		fwd(all + i, b, 1, best);
 		gpu_draft(p0, b, 0, 0, 0, NULL, NULL);
 		i += b; E.last = best[b - 1];
 	}
@@ -662,7 +661,7 @@ static int generate(int max_new, int (*cb)(void *, int), void *ctx) {
 		else draft(0, 0, E.last, pos0, NDRAFT, vb + 1, mg);
 		int L = choose(mg, NDRAFT);
 		double t0 = now();
-		fwd(vb, L + 1, 0, best, NULL);
+		fwd(vb, L + 1, 0, best);
 		cost[L + 1] = 0.9 * cost[L + 1] + 0.1 * (now() - t0) * 1e3;
 		int acc = 0, stop = 0;
 		while (acc < L && vb[acc + 1] == best[acc]) acc++;
